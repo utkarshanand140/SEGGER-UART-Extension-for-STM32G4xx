@@ -80,3 +80,178 @@ Author : Utkarsh Anand
 #define USART_RX_ERROR_FLAGS    0xB      // Overrun error, noise error, framing error, Parity error flags (SR)  
 #define USART_TCIE              6        // Transmission complete interrupt enable (CR1)
 
+typedef void UART_ON_RX_FUNC(uint8_t Data);
+typedef int UART_ON_TX_FUNC(uint8_t* pChar);
+
+typedef UART_ON_TX_FUNC* UART_ON_TX_FUNC_P;
+typedef UART_ON_RX_FUNC* UART_ON_RX_FUNC_P;
+
+static UART_ON_RX_FUNC_P _cbOnRx;
+static UART_ON_TX_FUNC_P _cbOnTx;
+
+void HIF_UART_Init(uint32_t Baudrate, UART_ON_TX_FUNC_P cbOnTx, UART_ON_RX_FUNC_P cbOnRx);
+
+#define _SERVER_HELLO_SIZE        (4)
+#define _TARGET_HELLO_SIZE        (4)
+
+static const U8 _abHelloMsg[_TARGET_HELLO_SIZE] = {'S', 'V', (SEGGER_SYSVIEW_VERSION / 10000), (SEGGER_SYSVIEW_VERSION / 1000) % 10};  // "Hello" message expected by SysView: [ 'S', 'V', <PROTOCOL_MAJOR>, <PROTOCOL_MINOR> ]
+
+static struct {
+    U8       NumBytesHelloRcvd;
+    U8       NumBytesHelloSent;
+    int      ChannelID;
+} _SVInfo = {0,0,1};
+
+static void _StartSysView(void)
+{
+    int r;
+
+    r = SEGGER_SYSVIEW_IsStarted();
+    if (r == 0) {
+        SEGGER_SYSVIEW_Start();
+    }
+}
+
+static void _cbOnUARTRx(U8 Data) {
+  if (_SVInfo.NumBytesHelloRcvd < _SERVER_HELLO_SIZE) {  // Not all bytes of <Hello> message received by SysView yet?
+    _SVInfo.NumBytesHelloRcvd++;
+    goto Done;
+  }
+  _StartSysView();
+  SEGGER_RTT_WriteDownBuffer(_SVInfo.ChannelID, &Data, 1);  // Write data into corresponding RTT buffer for application to read and handle accordingly
+Done:
+  return;
+}
+
+static int _cbOnUARTTx(U8* pChar) {
+  int r;
+
+  if (_SVInfo.NumBytesHelloSent < _TARGET_HELLO_SIZE) {  // Not all bytes of <Hello> message sent to SysView yet?
+    *pChar = _abHelloMsg[_SVInfo.NumBytesHelloSent];
+    _SVInfo.NumBytesHelloSent++;
+    r = 1;
+    goto Done;
+  }
+  r = SEGGER_RTT_ReadUpBufferNoLock(_SVInfo.ChannelID, pChar, 1);
+  if (r < 0) {  // Failed to read from up buffer?
+    r = 0;
+  }
+Done:
+  return r;
+}
+
+void SEGGER_UART_init(U32 baud)
+{
+	HIF_UART_Init(baud, _cbOnUARTTx, _cbOnUARTRx);
+}
+
+void HIF_UART_WaitForTxEnd(void) {
+  //
+  // Wait until transmission has finished (e.g. before changing baudrate).
+  //
+  while ((USART_SR & (1 << USART_TXE)) == 0);  // Wait until transmit buffer empty (Last byte shift from data to shift register)
+  while ((USART_SR & (1 << USART_TC)) == 0);   // Wait until transmission is complete
+}
+
+void USART2_IRQHandler(void);
+void USART2_IRQHandler(void) {
+  int UsartStatus;
+  uint8_t v;
+  int r;
+
+  UsartStatus = USART_SR;                              // Examine status register
+  if (UsartStatus & (1 << USART_RXNE)) {               // Data received?
+    v = USART_DR;                                      // Read data
+    if ((UsartStatus & USART_RX_ERROR_FLAGS) == 0) {   // Only process data if no error occurred
+      (void)v;                                         // Avoid warning in BTL
+      if (_cbOnRx) {
+        _cbOnRx(v);
+      }
+    }
+  }
+  if (UsartStatus & (1 << USART_TXE)) {                // Tx (data register) empty? => Send next character Note: Shift register may still hold a character that has not been sent yet.
+    //
+    // Under special circumstances, (old) BTL of Flasher does not wait until a complete string has been sent via UART,
+    // so there might be an TxE interrupt pending *before* the FW had a chance to set the callbacks accordingly which would result in a NULL-pointer call...
+    // Therefore, we need to check if the function pointer is valid.
+    //
+    if (_cbOnTx == NULL) {  // No callback set? => Nothing to do...
+      return;
+    }
+    r = _cbOnTx(&v);
+    if (r == 0) {                          // No more characters to send ?
+      USART_CR1 &= ~(1UL << USART_TXEIE);  // Disable further tx interrupts
+    } else {
+      USART_SR;      // Makes sure that "transmission complete" flag in USART_SR is reset to 0 as soon as we write USART_DR. If USART_SR is not read before, writing USART_DR does not clear "transmission complete". See STM32F4 USART documentation for more detailed description.
+      USART_DR = v;  // Start transmission by writing to data register
+    }
+  }
+}
+
+void HIF_UART_EnableTXEInterrupt(void) {
+  USART_CR1 |= (1 << USART_TXEIE);  // enable Tx empty interrupt => Triggered as soon as data register content has been copied to shift register
+}
+
+void HIF_UART_Init(uint32_t Baudrate, UART_ON_TX_FUNC_P cbOnTx, UART_ON_RX_FUNC_P cbOnRx) {
+  uint32_t v;
+  uint32_t Div;
+  //
+  // Configure USART RX/TX pins for alternate function AF7
+  //
+  RCC_APB1ENR |= (1 <<  17);        // Enable USART2 clock
+  RCC_AHB2ENR |= (1 <<  0);        // Enable IO port A clock
+  v  = GPIO_AFRL;
+  v &= ~((15UL << ((GPIO_UART_TX_BIT) << 2)) | (15UL << ((GPIO_UART_RX_BIT) << 2)));
+  v |=   ((7UL << ((GPIO_UART_TX_BIT) << 2)) | (7UL << ((GPIO_UART_RX_BIT) << 2)));
+  GPIO_AFRL = v;
+  //
+  // Configure USART RX/TX pins for alternate function usage
+  //
+  v  = GPIO_MODER;
+  v &= ~((3UL << (GPIO_UART_TX_BIT << 1)) | (3UL << (GPIO_UART_RX_BIT << 1)));
+  v |=  ((2UL << (GPIO_UART_TX_BIT << 1)) | (2UL << (GPIO_UART_RX_BIT << 1)));         // PA10: alternate function
+  GPIO_MODER = v;
+  //
+  // Initialize USART
+  //
+  USART_CR1 = 0
+            | (1 << 15)                         // OVER8  = 1; Oversampling by 8
+            | (0 <<  0)                         // UE     = 1; USART disabled
+            | (0 << 12)                         // M0      = 0; Word length is 1 start bit, 8 data bits (Can only be written when USART is disabled)
+            | (0 << 28)                         // M1      = 0; Word length is 1 start bit, 8 data bits (Can only be written when USART is disabled)
+            | (1 <<  0)                         // UE     = 1; USART enabled
+            | (0 << 10)                         // PCE    = 0; No parity control
+            | (1 <<  5)                         // RXNEIE = 1; RXNE interrupt enabled
+            | (1 <<  3)                         // TE     = 1; Transmitter enabled
+            | (1 <<  2)                         // RE     = 1; Receiver enabled
+            ;
+  USART_CR2 = 0
+            | (0 << 12)                         // STOP = 00b; 1 stop bit
+            ;
+  USART_CR3 = 0
+            | (0 << 11)                         // ONEBIT = 0; Three sample bit method
+            | (1 <<  7)                         // DMAT   = 1; DMA for transmitter enabled
+            ;
+  //
+  // Set baudrate
+  //
+  Div = Baudrate * 8;                       // We use 8x oversampling.
+  Div = ((2 * (UART_BASECLK)) / Div) + 1;   // Calculate divider for baudrate and round it correctly. This is necessary to get a tolerance as small as possible.
+  Div = Div / 2;
+  if (Div > 0xFFF) {
+    Div = 0xFFF;        // Limit to 12 bit (mantissa in BRR)
+  }
+  if (Div >= 1) {
+    USART_BRR = 0xFFF0 & (Div << 4);    // Use only mantissa of fractional divider
+  }
+  //
+  // Setup callbacks which are called by ISR handler and enable interrupt in NVIC
+  //
+  _cbOnRx = cbOnRx;
+  _cbOnTx = cbOnTx;
+  NVIC_SetPriority(USART_IRQn, 6);  // Highest prio, so it is not disabled by embOS
+  NVIC_EnableIRQ(USART_IRQn);
+}
+
+#endif
+
