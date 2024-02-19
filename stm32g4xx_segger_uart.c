@@ -145,6 +145,11 @@ void SEGGER_UART_init(U32 baud)
 	HIF_UART_Init(baud, _cbOnUARTTx, _cbOnUARTRx);
 }
 
+/***********************************************************************************
+ * 
+ *          HIF_UART_WaitForTxEnd
+ */
+
 void HIF_UART_WaitForTxEnd(void) {
   //
   // Wait until transmission has finished (e.g. before changing baudrate).
@@ -152,6 +157,20 @@ void HIF_UART_WaitForTxEnd(void) {
   while ((USART_SR & (1 << USART_TXE)) == 0);  // Wait until transmit buffer empty (Last byte shift from data to shift register)
   while ((USART_SR & (1 << USART_TC)) == 0);   // Wait until transmission is complete
 }
+
+
+/*********************************************************************
+*
+*       USART1_IRQHandler
+*
+*  Function descriptio
+*    Interrupt handler.
+*    Handles both, Rx and Tx interrupts
+*
+*  Notes
+*    (1) This is a high-prio interrupt so it may NOT use embOS functions
+*        However, this also means that embOS will never disable this interrupt
+*/
 
 void USART2_IRQHandler(void);
 void USART2_IRQHandler(void) {
@@ -191,6 +210,11 @@ void USART2_IRQHandler(void) {
 void HIF_UART_EnableTXEInterrupt(void) {
   USART_CR1 |= (1 << USART_TXEIE);  // enable Tx empty interrupt => Triggered as soon as data register content has been copied to shift register
 }
+
+/*********************************************************************
+*
+*       HIF_UART_Init()
+*/
 
 void HIF_UART_Init(uint32_t Baudrate, UART_ON_TX_FUNC_P cbOnTx, UART_ON_RX_FUNC_P cbOnRx) {
   uint32_t v;
