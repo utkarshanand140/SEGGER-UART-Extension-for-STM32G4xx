@@ -1,4 +1,4 @@
-#SEGGER UART EXTENTION ADAPTATION FOR STM32G4xx
+# SEGGER UART EXTENTION ADAPTATION FOR STM32G4xx
 
 This project is an adaption of the original segger_uart.c file for using SystemView software on STM32G4xx MCUs. This file is essential for monitoring RTOS traces on the SEGGER SYSTEMVIEW in real-time over the UART ports.
 
